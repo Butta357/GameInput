@@ -1,259 +1,290 @@
+import sys
 import pandas as pd
 import matplotlib.pyplot as plt
-import os
-from scipy.optimize import curve_fit
 import numpy as np
+from scipy.optimize import curve_fit
+from scipy.ndimage import uniform_filter1d
+from pathlib import Path
 
-def dual_zone_curve(input_val, deadzone, midzone, sensitivity):
-    """
-    Create a dual zone response curve for controller input.
-    
-    Args:
-        input_val: Raw input value (-1 to 1)
-        deadzone: Dead zone size (0 to 1)
-        midzone: Mid zone breakpoint (0 to 1)
-        sensitivity: Sensitivity multiplier for outer zone
-    
-    Returns:
-        Processed output value (-1 to 1)
-    """
-    val = abs(input_val)
-    
-    if val < deadzone:
-        # Dead zone - return 0
-        return 0
-    elif val < midzone:
-        # Linear zone - scale from deadzone to midzone
-        normalized = (val - deadzone) / (midzone - deadzone)
-        output = normalized * 0.5  # Maps to 0 to 0.5
-    else:
-        # Outer zone - accelerated response with sensitivity
-        normalized = (val - midzone) / (1.0 - midzone)
-        output = 0.5 + normalized * 0.5 * sensitivity  # Maps from 0.5 to 1.0
-    
-    # Return with original sign
-    return output * np.sign(input_val)
+DATA_DIR = Path(__file__).parent / "data"
+ARCHIVE_DIR = DATA_DIR / "archived"
 
-def analyze_and_create_curve(df, axis_col):
-    """Analyze recorded data and create optimal dual zone curve."""
-    
-    # Calculate statistics
-    axis_data = df[axis_col].values
-    
-    # Determine dead zone from noise around center
-    center_data = axis_data[np.abs(axis_data) < 0.15]
-    deadzone = np.std(center_data) * 2.5 if len(center_data) > 0 else 0.05
-    deadzone = np.clip(deadzone, 0.02, 0.20)
-    
-    # Determine mid zone from data distribution
-    outer_values = np.abs(axis_data[np.abs(axis_data) > deadzone])
-    if len(outer_values) > 0:
-        midzone = np.percentile(outer_values, 60)
-        midzone = np.clip(midzone, deadzone + 0.1, 0.7)
-    else:
-        midzone = np.clip(deadzone + 0.1, 0.1, 0.7)
-    
-    # Calculate sensitivity from outer zone usage
-    outer_data = axis_data[np.abs(axis_data) > midzone]
-    sensitivity = 1.2 if len(outer_data) > 0 else 1.0
-    
-    return deadzone, midzone, sensitivity
+# ── Session loading ────────────────────────────────────────────────────────────
+# Default: combine ALL sessions.
+# Flags:
+#   --latest N      use only the N most recent sessions
+#   --archive       after analysis, move the analyzed sessions to data/archived/
+#   --archive-old   after analysis, move sessions NOT analyzed to data/archived/
+# Examples:
+#   python analyzer.py --latest 3 --archive-old   # analyze 3, archive the rest
+#   python analyzer.py --archive                  # analyze all, then archive all
 
-# Load latest session
-files = [f for f in os.listdir('data') if f.startswith('session_')]
-if not files:
-    print("No sessions found")
+all_files = sorted(
+    [f for f in DATA_DIR.iterdir() if f.name.startswith('session_') and f.suffix == '.csv'],
+    key=lambda f: f.name,
+)
+if not all_files:
+    print("No sessions found in data/")
     exit()
 
-latest = max(files)
-df = pd.read_csv(f'data/{latest}')
-print(f"Analyzing {latest}")
-print(df.head())
+n_sessions = len(all_files)
+if '--latest' in sys.argv:
+    try:
+        n_sessions = int(sys.argv[sys.argv.index('--latest') + 1])
+    except (IndexError, ValueError):
+        print("Usage: python analyzer.py --latest N")
+        exit(1)
 
-# Plot axes over time
-for col in df.columns[1:]:
-    if 'axis' in col:
-        plt.figure(figsize=(10, 6))
-        plt.plot(df['timestamp'] - df['timestamp'].min(), df[col])
-        plt.title(f'{col} over time')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Axis value')
-        plt.savefig(f'data/{col}_plot.png')
-        plt.close()
+selected = all_files[-n_sessions:]
 
-# Create dual zone curves for main axes (axis_0 and axis_1 are typically left stick X and Y)
-for axis_idx in [0, 1]:
-    axis_col = f'axis_{axis_idx}'
-    if axis_col not in df.columns:
-        continue
-    
-    # Analyze and get curve parameters
-    deadzone, midzone, sensitivity = analyze_and_create_curve(df, axis_col)
-    
-    # Create response curve visualization
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
-    # Plot 1: Input distribution
-    ax1.hist(df[axis_col], bins=50, alpha=0.7, color='blue')
-    ax1.axvline(deadzone, color='red', linestyle='--', label=f'Dead Zone: ±{deadzone:.3f}')
-    ax1.axvline(-deadzone, color='red', linestyle='--')
-    ax1.axvline(midzone, color='orange', linestyle='--', label=f'Mid Zone: ±{midzone:.3f}')
-    ax1.axvline(-midzone, color='orange', linestyle='--')
-    ax1.set_title(f'{axis_col} - Input Value Distribution')
-    ax1.set_xlabel('Input Value')
-    ax1.set_ylabel('Frequency')
-    ax1.legend()
-    ax1.grid(alpha=0.3)
-    
-    # Plot 2: Dual zone response curve
-    input_range = np.linspace(-1, 1, 200)
-    output_range = [dual_zone_curve(val, deadzone, midzone, sensitivity) for val in input_range]
-    
-    ax2.plot(input_range, output_range, 'b-', linewidth=2, label='Dual Zone Curve')
-    ax2.plot(input_range, input_range, 'k--', alpha=0.3, label='Linear (no processing)')
-    ax2.fill_between(input_range, -deadzone, deadzone, alpha=0.2, color='red', label='Dead Zone')
-    ax2.fill_between([-midzone, midzone], -1, 1, alpha=0.1, color='orange', label='Mid Zone')
-    ax2.set_xlim(-1, 1)
-    ax2.set_ylim(-1, 1)
-    ax2.set_title(f'{axis_col} - Dual Zone Response Curve')
-    ax2.set_xlabel('Raw Input')
-    ax2.set_ylabel('Processed Output')
-    ax2.legend()
-    ax2.grid(alpha=0.3)
-    ax2.set_aspect('equal')
-    
+print(f"Loading {len(selected)} session(s):")
+frames = []
+for f in selected:
+    session_df = pd.read_csv(f)
+    session_df['_session'] = f.name
+    frames.append(session_df)
+    duration = session_df['timestamp'].iloc[-1] - session_df['timestamp'].iloc[0]
+    print(f"  {f.name}  —  {len(session_df):,} samples  ({duration:.0f}s)")
+
+df = pd.concat(frames, ignore_index=True)
+total_duration = sum(
+    g['timestamp'].iloc[-1] - g['timestamp'].iloc[0]
+    for _, g in df.groupby('_session')
+)
+print(f"\nCombined total: {len(df):,} samples  across {len(selected)} session(s)  ({total_duration:.0f}s active)\n")
+
+axis_cols = [col for col in df.columns if col.startswith('axis')]
+
+# ── Hit event extraction ──────────────────────────────────────────────────────
+# Cluster consecutive hit=1 rows (each hit marker spans ~50 ms) into single
+# events and record the mean timestamp of each cluster.
+# The analyser then looks 50–300 ms *before* each event to find stick state
+# at the actual moment the shot was fired (accounting for server latency +
+# hit-marker animation delay).
+
+hit_events = np.array([])
+if 'hit' in df.columns and df['hit'].sum() > 0:
+    hit_ts = df.loc[df['hit'] == 1, 'timestamp'].values
+    clusters, cluster = [], [hit_ts[0]]
+    for t in hit_ts[1:]:
+        if t - cluster[-1] > 0.15:
+            clusters.append(np.mean(cluster))
+            cluster = []
+        cluster.append(t)
+    clusters.append(np.mean(cluster))
+    hit_events = np.array(clusters)
+    print(f"Hit events found: {len(hit_events)} across {len(selected)} session(s)\n")
+
+
+# ── Curve model ───────────────────────────────────────────────────────────────
+
+def _dual_zone_curve(x, bp, static_ratio):
+    """
+    Dual-Zone S-Curve matching Marvel Rivals' model.
+      Inner zone [0, bp]  : linear ramp 0 → static_ratio  (precision)
+      Outer zone [bp, 1]  : power ramp  static_ratio → 1.0 (speed)
+    All values in normalized [0, 1] space.
+    """
+    inner = (x / bp) * static_ratio
+    outer = static_ratio + (1.0 - static_ratio) * ((x - bp) / (1.0 - bp)) ** 1.5
+    return np.where(x < bp, inner, outer)
+
+
+def _find_zone_breakpoint_estimate(x_norm, dz_norm):
+    """
+    Find the valley between the inner precision cluster and outer speed cluster.
+    Falls back to 0.55 when the distribution isn't clearly bimodal.
+    """
+    region = x_norm[(x_norm > dz_norm + 0.05) & (x_norm < 0.92)]
+    if len(region) < 30:
+        return 0.55
+    counts, edges = np.histogram(region, bins=25)
+    centers = (edges[:-1] + edges[1:]) / 2
+    smoothed = uniform_filter1d(counts.astype(float), size=3)
+    mid = (centers > 0.15) & (centers < 0.85)
+    if mid.sum() < 3:
+        return 0.55
+    return float(centers[mid][np.argmin(smoothed[mid])])
+
+
+# ── Per-axis analysis ─────────────────────────────────────────────────────────
+
+def analyze_axis(col, values, timestamps, session_groups):
+    abs_values = np.abs(values)
+
+    # Deadzone — noise floor when stick rests near zero
+    idle_mask = abs_values < 0.08
+    if idle_mask.sum() >= 20:
+        deadzone = round(float(np.percentile(abs_values[idle_mask], 99)) * 1.2, 4)
+    else:
+        deadzone = 0.05
+
+    active = abs_values[abs_values > deadzone]
+    if len(active) < 30:
+        print(f"{col}: not enough active samples (deadzone={deadzone})")
+        return
+
+    # Max used range — outer clamp
+    max_range = float(np.percentile(active, 98))
+    if max_range < 0.01:
+        print(f"{col}: stick barely moved, skipping")
+        return
+
+    x_norm = np.clip(active / max_range, 0, 1)
+    dz_norm = deadzone / max_range
+
+    # Fit dual-zone curve to empirical CDF
+    sorted_x = np.sort(x_norm)
+    empirical_cdf = np.arange(1, len(sorted_x) + 1) / len(sorted_x)
+
+    bp_est = _find_zone_breakpoint_estimate(x_norm, dz_norm)
+    inner_frac = float(np.mean(x_norm < bp_est))
+    static_est = max(0.15, min(0.55, inner_frac * 0.6))
+
+    try:
+        popt, _ = curve_fit(
+            _dual_zone_curve,
+            sorted_x,
+            empirical_cdf,
+            p0=[bp_est, static_est],
+            bounds=([dz_norm + 0.05, 0.10], [0.90, 0.65]),
+        )
+        bp_norm, static_ratio = float(popt[0]), float(popt[1])
+    except RuntimeError:
+        bp_norm, static_ratio = bp_est, static_est
+
+    bp_norm = round(bp_norm, 3)
+    static_ratio = round(static_ratio, 3)
+
+    # Marvel Rivals: Advanced Aim Sensitivity Curve Settings
+    mr_custom_min_range     = max(1,  round(deadzone * 100))     # Custom Minimum Range
+    mr_custom_max_range     = min(99, round(max_range * 100))    # Custom Maximum Range
+    mr_min_curve_statics    = round(static_ratio * 100)          # Minimum Curve Statics
+    mr_custom_max_dualzone  = round(bp_norm * 100)               # Custom Maximum Dual-zone Curve
+
+    p25, p50, p75, p95 = (round(float(np.percentile(active, p)), 3) for p in (25, 50, 75, 95))
+    inner_usage = round(float(np.mean(x_norm < bp_norm)) * 100, 1)
+
+    # Hit-moment stick positions — look back 50–300 ms before each hit event
+    # to recover the stick state when the shot was actually fired.
+    effective_abs = np.array([])
+    if len(hit_events) > 0:
+        ev_vals = []
+        for ht in hit_events:
+            mask = (timestamps >= ht - 0.30) & (timestamps < ht - 0.05)
+            ev_vals.extend(np.abs(values[mask]))
+        if ev_vals:
+            effective_abs = np.array(ev_vals)
+
+    print(f"{col}  ({len(values):,} samples across {len(session_groups)} session(s)):")
+    print(f"  ── Advanced Aim Sensitivity Curve Settings (Dual-Zone S-Curve) ──")
+    print(f"  Custom Minimum Range          : {mr_custom_min_range}")
+    print(f"  Custom Maximum Range          : {mr_custom_max_range}")
+    print(f"  Minimum Curve Statics         : {mr_min_curve_statics}")
+    print(f"  Custom Maximum Dual-zone Curve: {mr_custom_max_dualzone}")
+    print(f"  ── Data summary ──")
+    print(f"  Inner zone usage   : {inner_usage}% of active samples")
+    print(f"  Active percentiles : p25={p25}  p50={p50}  p75={p75}  p95={p95}")
+    if len(effective_abs) >= 5:
+        ep25, ep50, ep75 = (round(float(np.percentile(effective_abs, p)), 3) for p in (25, 50, 75))
+        eff_max = round(float(np.percentile(effective_abs, 95)), 3)
+        print(f"  ── Hit-moment aim analysis ({len(hit_events)} events, {len(effective_abs)} samples) ──")
+        print(f"  Effective percentiles : p25={ep25}  p50={ep50}  p75={ep75}")
+        if eff_max < max_range * 0.85:
+            suggested_max = round(eff_max * 100)
+            print(f"  Note: effective max ({eff_max}) is well below overall max ({max_range:.3f})")
+            print(f"        Consider lowering Custom Maximum Range to ~{suggested_max}")
+    print()
+
+    # Time-series — one continuous line per session with gap + boundary markers
+    plt.figure(figsize=(12, 4))
+    offset = 0.0
+    for i, (_, grp) in enumerate(session_groups):
+        t = grp['timestamp'].values - grp['timestamp'].values[0] + offset
+        plt.plot(t, grp[col].values, linewidth=0.5, color='steelblue')
+        offset = t[-1] + 3.0
+        if i < len(session_groups) - 1:
+            plt.axvline(offset - 1.5, color='gray', linestyle=':', linewidth=0.8, alpha=0.6,
+                        label='Session boundary' if i == 0 else None)
+    plt.title(f'{col} – Input over time ({len(session_groups)} session(s))')
+    plt.xlabel('Time (s, sessions separated by gaps)')
+    plt.ylabel('Axis value')
+    if len(session_groups) > 1:
+        plt.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(f'data/{axis_col}_dual_zone_curve.png', dpi=150)
+    plt.savefig(DATA_DIR / f'{col}_plot.png')
     plt.close()
-    
-    print(f"\n{axis_col} Curve Parameters:")
-    print(f"  Dead Zone: ±{deadzone:.4f}")
-    print(f"  Mid Zone: ±{midzone:.4f}")
-    print(f"  Sensitivity: {sensitivity:.2f}")
-    
-    # Apply curve to data and show before/after
-    processed = df[axis_col].apply(lambda x: dual_zone_curve(x, deadzone, midzone, sensitivity))
-    
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-    time_data = df['timestamp'] - df['timestamp'].min()
-    
-    ax1.plot(time_data, df[axis_col], 'b-', alpha=0.7, label='Raw Input')
-    ax1.fill_between([-deadzone, deadzone], -1, 1, alpha=0.1, color='red', label='Dead Zone')
-    ax1.set_ylabel('Raw Input Value')
-    ax1.set_title(f'{axis_col} - Before & After Processing')
-    ax1.legend()
-    ax1.grid(alpha=0.3)
-    
-    ax2.plot(time_data, processed, 'g-', alpha=0.7, label='Processed Output')
-    ax2.set_xlabel('Time (s)')
-    ax2.set_ylabel('Processed Output Value')
-    ax2.legend()
-    ax2.grid(alpha=0.3)
-    
+
+    # Histogram with deadzone and zone boundary markers
+    bp_abs = bp_norm * max_range
+    plt.figure(figsize=(8, 4))
+    plt.hist(values, bins=60, color='steelblue', alpha=0.7, label='All inputs')
+    if len(effective_abs) >= 5:
+        # Mirror hit-moment absolute values to both sides for a symmetric overlay
+        plt.hist(np.concatenate([effective_abs, -effective_abs]), bins=40,
+                 color='limegreen', alpha=0.55, label=f'Hit moments (n={len(hit_events)})')
+    plt.axvline( deadzone, color='red',    linestyle='--', label=f'Custom Minimum Range (±{mr_custom_min_range})')
+    plt.axvline(-deadzone, color='red',    linestyle='--')
+    plt.axvline( bp_abs,   color='orange', linestyle='--', label=f'Custom Max Dual-zone Curve (±{mr_custom_max_dualzone})')
+    plt.axvline(-bp_abs,   color='orange', linestyle='--')
+    plt.title(f'{col} – Input distribution ({len(session_groups)} session(s))')
+    plt.xlabel('Axis value')
+    plt.ylabel('Sample count')
+    plt.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(f'data/{axis_col}_before_after.png', dpi=150)
+    plt.savefig(DATA_DIR / f'{col}_hist.png')
     plt.close()
 
-print("\nAnalysis complete. Plots saved in data/")
-print("Generated files:")
-print("  - *_plot.png: Input over time")
-print("  - *_dual_zone_curve.png: Response curve visualization")
-print("  - *_before_after.png: Before/after processing comparison")
+    # Dual-zone response curve
+    x_plot = np.linspace(0, 1, 300)
+    plt.figure(figsize=(7, 6))
+    plt.plot(x_plot, x_plot, '--', color='gray', label='Linear reference')
+    plt.plot(x_plot, _dual_zone_curve(x_plot, bp_norm, static_ratio), color='royalblue', linewidth=2,
+             label=f'Dual-Zone S-Curve\nMin Curve Statics={mr_min_curve_statics}  Max Dual-zone={mr_custom_max_dualzone}')
+    plt.axvline(dz_norm,  color='red',    linestyle=':', linewidth=1.2, label=f'Custom Minimum Range ({mr_custom_min_range})')
+    plt.axvline(bp_norm,  color='orange', linestyle=':', linewidth=1.2, label=f'Custom Max Dual-zone Curve ({mr_custom_max_dualzone})')
+    plt.axhline(static_ratio, color='orange', linestyle=':', linewidth=0.8, alpha=0.5)
+    if len(effective_abs) >= 5:
+        eff_p25_norm = float(np.percentile(effective_abs, 25)) / max_range
+        eff_p75_norm = float(np.percentile(effective_abs, 75)) / max_range
+        plt.axvspan(eff_p25_norm, min(eff_p75_norm, 1.0), alpha=0.12, color='limegreen',
+                    label='Effective aim range (hit p25–p75)')
+    plt.xlabel('Normalized physical input')
+    plt.ylabel('Suggested output')
+    plt.title(f'{col} – Dual-Zone S-Curve (Marvel Rivals)')
+    plt.legend(fontsize=8)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(DATA_DIR / f'{col}_curve.png')
+    plt.close()
 
-# Generate Marvel Rivals settings
-print("\n" + "="*60)
-print("MARVEL RIVALS - RECOMMENDED CONTROLLER SETTINGS")
-print("="*60)
 
-if 'axis_0' in df.columns and 'axis_1' in df.columns:
-    # Average the parameters from both stick axes
-    params_0 = {'deadzone': 0.05, 'midzone': 0.5, 'sensitivity': 1.2}
-    params_1 = {'deadzone': 0.05, 'midzone': 0.5, 'sensitivity': 1.2}
-    
-    for axis_idx in [0, 1]:
-        axis_col = f'axis_{axis_idx}'
-        deadzone, midzone, sensitivity = analyze_and_create_curve(df, axis_col)
-        
-        if axis_idx == 0:
-            params_0 = {'deadzone': deadzone, 'midzone': midzone, 'sensitivity': sensitivity}
-        else:
-            params_1 = {'deadzone': deadzone, 'midzone': midzone, 'sensitivity': sensitivity}
-    
-    # Average parameters
-    avg_deadzone = (params_0['deadzone'] + params_1['deadzone']) / 2
-    avg_sensitivity = (params_0['sensitivity'] + params_1['sensitivity']) / 2
-    
-    # Convert to Marvel Rivals Dual Zone S Curve scale (0-100 sliders)
-    custom_minimum_range = int(np.clip(100 - round(avg_deadzone * 100), 1, 99))
-    custom_maximum_range = max(custom_minimum_range + 1,
-                               int(np.clip(100 - round(params_0['midzone'] * 100), 1, 100)))
-    # Minimum curve statics should stay below the maximum dual-zone curve
-    minimum_curve_statics = int(np.clip(50 - round((avg_sensitivity - 1.0) * 20), 1, 98))
-    custom_maximum_dual_zone_curve = max(minimum_curve_statics + 1,
-                                         int(np.clip(50 + round((avg_sensitivity - 1.0) * 50), 1, 100)))
-    aim_ease_deadzone = int(np.clip(round(avg_deadzone * 100), 0, 100))
-    eye_gaze_deadzone = int(np.clip(round(avg_deadzone * 100), 0, 100))
-    horizontal_deadzone_boost = int(np.clip(round((avg_sensitivity - 1.0) * 100), 0, 100))
-    
-    print("\nSTICK SETTINGS:")
-    print(f"  Horizontal Sensitivity: 200")
-    print(f"  Vertical Sensitivity: 200")
-    print(f"\nADVANCED SETTINGS (Dual Zone S Curve):")
-    print(f"  Aim Sensitivity Curve Type: Dual Zone S Curve")
-    print(f"  Custom Minimum Range: {custom_minimum_range}")
-    print(f"  Custom Maximum Range: {custom_maximum_range}")
-    print(f"  Minimum Curve Statics: {minimum_curve_statics}")
-    print(f"  Custom Maximum Dual-zone Curve: {custom_maximum_dual_zone_curve}")
-    print(f"  Eye-Gaze Targeting Minimum Input Deadzone: {aim_ease_deadzone}")
-    print(f"  Eye-Gaze Targeting Maximum Input Deadzone: {eye_gaze_deadzone}")
-    print(f"  Horizontal Max Deadzone Sensitivity Boost: {horizontal_deadzone_boost}")
-    
-    print(f"\nCALCULATED FROM YOUR SESSION:")
-    print(f"  Average Deadzone: ±{avg_deadzone:.4f}")
-    print(f"  Average Sensitivity Multiplier: {avg_sensitivity:.2f}x")
-    print(f"  Left Stick - DZ: ±{params_0['deadzone']:.4f}, Sens: {params_0['sensitivity']:.2f}x")
-    print(f"  Right Stick - DZ: ±{params_1['deadzone']:.4f}, Sens: {params_1['sensitivity']:.2f}x")
-    
-    print("\nHOW TO APPLY IN MARVEL RIVALS:")
-    print("  1. Open Settings > Controls > Gamepad")
-    print("  2. Expand 'Advanced' section")
-    print("  3. Set 'Aim Sensitivity Curve Type' to 'Dual Zone S Curve'")
-    print(f"  4. Set 'Custom Minimum Range' to {custom_minimum_range}")
-    print(f"  5. Set 'Custom Maximum Range' to {custom_maximum_range}")
-    print(f"  6. Set 'Minimum Curve Statics' to {minimum_curve_statics}")
-    print(f"  7. Set 'Custom Maximum Dual-zone Curve' to {custom_maximum_dual_zone_curve}")
-    print(f"  8. Set 'Eye-Gaze Targeting Minimum Input Deadzone' to {aim_ease_deadzone}")
-    print(f"  9. Set 'Eye-Gaze Targeting Maximum Input Deadzone' to {eye_gaze_deadzone}")
-    print(f" 10. Set 'Horizontal Max Deadzone Sensitivity Boost' to {horizontal_deadzone_boost}")
-    print(" 11. Apply and test!")
-    
-    # Save to config file
-    rivals_config = {
-        'horizontal_sensitivity': 200,
-        'vertical_sensitivity': 200,
-        'aim_curve_type': 'Dual Zone S Curve',
-        'custom_minimum_range': custom_minimum_range,
-        'custom_maximum_range': custom_maximum_range,
-        'minimum_curve_statics': minimum_curve_statics,
-        'custom_maximum_dual_zone_curve': custom_maximum_dual_zone_curve,
-        'eye_gaze_targeting_minimum_input_deadzone': aim_ease_deadzone,
-        'eye_gaze_targeting_maximum_input_deadzone': eye_gaze_deadzone,
-        'horizontal_max_deadzone_sensitivity_boost': horizontal_deadzone_boost,
-        'calibration_data': {
-            'average_deadzone': float(avg_deadzone),
-            'average_sensitivity': float(avg_sensitivity),
-            'left_stick_deadzone': float(params_0['deadzone']),
-            'left_stick_sensitivity': float(params_0['sensitivity']),
-            'right_stick_deadzone': float(params_1['deadzone']),
-            'right_stick_sensitivity': float(params_1['sensitivity']),
-        }
-    }
-    
-    import json
-    rivals_config_path = 'data/marvel_rivals_settings.json'
-    with open(rivals_config_path, 'w') as f:
-        json.dump(rivals_config, f, indent=2)
-    
-    print(f"\n✓ Settings saved to: {rivals_config_path}")
+# ── Run ───────────────────────────────────────────────────────────────────────
 
-print("\n" + "="*60)
+session_groups = list(df.groupby('_session', sort=True))
+
+timestamps = df['timestamp'].values
+
+for col in axis_cols:
+    analyze_axis(col, df[col].values, timestamps, session_groups)
+
+print("Analysis complete. Plots saved in data/")
+
+# ── Archive ───────────────────────────────────────────────────────────────────
+
+do_archive     = '--archive'     in sys.argv
+do_archive_old = '--archive-old' in sys.argv
+
+if do_archive or do_archive_old:
+    to_archive = selected if do_archive else list(set(all_files) - set(selected))
+
+    if not to_archive:
+        print("\nNothing to archive.")
+    else:
+        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        label = "analyzed" if do_archive else "older"
+        print(f"\nArchiving {len(to_archive)} {label} session(s) → data/archived/")
+        for f in to_archive:
+            dest = ARCHIVE_DIR / f.name
+            f.rename(dest)
+            print(f"  {f.name}")
