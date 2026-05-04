@@ -1,4 +1,6 @@
+import sys
 import tkinter as tk
+import tkinter.messagebox
 import threading
 import pygame
 import time
@@ -17,7 +19,7 @@ class App(tk.Tk):
         pygame.init()
         pygame.joystick.init()
         if pygame.joystick.get_count() == 0:
-            tk.messagebox.showerror("Error", "No joystick found")
+            tkinter.messagebox.showerror("Error", "No joystick found")
             self.quit()
             return
         self.joystick = pygame.joystick.Joystick(0)
@@ -81,10 +83,10 @@ class App(tk.Tk):
 
     def analyze(self):
         try:
-            subprocess.run(["python", "analyzer.py"], check=True)
-            tk.messagebox.showinfo("Analysis", "Analysis complete. Check data folder for plots.")
+            subprocess.run([sys.executable, "analyzer.py"], check=True)
+            tkinter.messagebox.showinfo("Analysis", "Analysis complete. Check data folder for plots.")
         except subprocess.CalledProcessError:
-            tk.messagebox.showerror("Error", "Analysis failed.")
+            tkinter.messagebox.showerror("Error", "Analysis failed.")
 
 if __name__ == "__main__":
     app = App()

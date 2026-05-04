@@ -1,0 +1,20 @@
+{
+  "horizontal_sensitivity": 200,
+  "vertical_sensitivity": 200,
+  "aim_curve_type": "Dual Zone S Curve",
+  "custom_minimum_range": 98,
+  "custom_maximum_range": 99,
+  "minimum_curve_statics": 50,
+  "custom_maximum_dual_zone_curve": 51,
+  "eye_gaze_targeting_minimum_input_deadzone": 2,
+  "eye_gaze_targeting_maximum_input_deadzone": 2,
+  "horizontal_max_deadzone_sensitivity_boost": 0,
+  "calibration_data": {
+    "average_deadzone": 0.02,
+    "average_sensitivity": 1.0,
+    "left_stick_deadzone": 0.02,
+    "left_stick_sensitivity": 1.0,
+    "right_stick_deadzone": 0.02,
+    "right_stick_sensitivity": 1.0
+  }
+}
