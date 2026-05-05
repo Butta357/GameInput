@@ -4,6 +4,7 @@ import threading
 import pygame
 import time
 import csv
+import json
 import re
 import sys
 import subprocess
@@ -175,9 +176,47 @@ class App(tk.Tk):
         analyzer = Path(__file__).parent / "analyzer.py"
         try:
             subprocess.run([sys.executable, str(analyzer)], check=True)
-            messagebox.showinfo("Analysis", "Analysis complete. Check data folder for plots.")
         except subprocess.CalledProcessError:
             messagebox.showerror("Error", "Analysis failed.")
+            return
+
+        lines = ["Analysis complete.\n"]
+        for settings_file in sorted(DATA_DIR.glob("*/settings.json")):
+            try:
+                with open(settings_file) as fp:
+                    s = json.load(fp)
+                r = s.get("recommended")
+                if r:
+                    lines.append(f"{s['character']}  (from {', '.join(r['source_axes'])})")
+                    diff = s.get("diff")
+                    if diff:
+                        for key, label in (("custom_minimum_range",           "Custom Minimum Range          "),
+                                           ("custom_maximum_range",           "Custom Maximum Range          "),
+                                           ("minimum_curve_statics",          "Minimum Curve Statics         "),
+                                           ("custom_maximum_dual_zone_curve", "Custom Maximum Dual-zone Curve")):
+                            d = diff[key]
+                            arrow = "->" if d["delta"] != 0 else "=="
+                            lines.append(f"  {label}: {d['current']:>3} {arrow} {d['recommended']:<3}  ({d['delta']:+d})")
+                        if diff.get("low_confidence"):
+                            lines.append("  !! LOW CONFIDENCE: aim stick barely moved, recommendation unreliable")
+                        elif diff.get("material_changes"):
+                            lines.append(f"  Material changes (>20%): {', '.join(diff['material_changes'])}")
+                    else:
+                        lines.append(f"  Custom Minimum Range          : {r['custom_minimum_range']}")
+                        lines.append(f"  Custom Maximum Range          : {r['custom_maximum_range']}")
+                        lines.append(f"  Minimum Curve Statics         : {r['minimum_curve_statics']}")
+                        lines.append(f"  Custom Maximum Dual-zone Curve: {r['custom_maximum_dual_zone_curve']}")
+                    cam = s.get("camera_motion")
+                    if cam:
+                        lines.append(f"  Camera motion p50={cam['p50']} p95={cam['p95']} saturated={cam['saturated_pct']}%")
+                    hint = r.get("sensitivity_hint")
+                    if hint:
+                        lines.append(f"  Sensitivity hint: {hint['suggestion']}")
+                    lines.append("")
+            except (OSError, json.JSONDecodeError):
+                pass
+        lines.append(f"Plots and settings.json saved under {DATA_DIR}\\<character>\\")
+        messagebox.showinfo("Analysis", "\n".join(lines))
 
 
 if __name__ == "__main__":
