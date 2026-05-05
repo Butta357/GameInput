@@ -1,4 +1,5 @@
 import sys
+import re
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,15 +10,28 @@ from pathlib import Path
 DATA_DIR = Path(__file__).parent / "data"
 ARCHIVE_DIR = DATA_DIR / "archived"
 
+# Filename forms:
+#   session_<character>_<YYYYMMDD>_<HHMMSS>.csv  (current)
+#   session_<YYYYMMDD>_<HHMMSS>.csv              (legacy → grouped under "unlabeled")
+_LABELED_RE = re.compile(r'^session_(.+?)_(\d{8}_\d{6})\.csv$')
+
+
+def _parse_character(path):
+    m = _LABELED_RE.match(path.name)
+    if m and any(c.isalpha() for c in m.group(1)):
+        return m.group(1).lower()
+    return None
+
+
 # ── Session loading ────────────────────────────────────────────────────────────
-# Default: combine ALL sessions.
+# Default: combine ALL sessions, grouped by character.
 # Flags:
-#   --latest N      use only the N most recent sessions
-#   --archive       after analysis, move the analyzed sessions to data/archived/
+#   --latest N      use only the N most recent sessions (across all characters)
+#   --archive       after analysis, move analyzed sessions to data/archived/
 #   --archive-old   after analysis, move sessions NOT analyzed to data/archived/
 # Examples:
-#   python analyzer.py --latest 3 --archive-old   # analyze 3, archive the rest
-#   python analyzer.py --archive                  # analyze all, then archive all
+#   python analyzer.py --latest 3 --archive-old
+#   python analyzer.py --archive
 
 all_files = sorted(
     [f for f in DATA_DIR.iterdir() if f.name.startswith('session_') and f.suffix == '.csv'],
@@ -37,43 +51,15 @@ if '--latest' in sys.argv:
 
 selected = all_files[-n_sessions:]
 
-print(f"Loading {len(selected)} session(s):")
-frames = []
+character_groups = {}
 for f in selected:
-    session_df = pd.read_csv(f)
-    session_df['_session'] = f.name
-    frames.append(session_df)
-    duration = session_df['timestamp'].iloc[-1] - session_df['timestamp'].iloc[0]
-    print(f"  {f.name}  —  {len(session_df):,} samples  ({duration:.0f}s)")
+    key = _parse_character(f) or 'unlabeled'
+    character_groups.setdefault(key, []).append(f)
 
-df = pd.concat(frames, ignore_index=True)
-total_duration = sum(
-    g['timestamp'].iloc[-1] - g['timestamp'].iloc[0]
-    for _, g in df.groupby('_session')
-)
-print(f"\nCombined total: {len(df):,} samples  across {len(selected)} session(s)  ({total_duration:.0f}s active)\n")
-
-axis_cols = [col for col in df.columns if col.startswith('axis')]
-
-# ── Hit event extraction ──────────────────────────────────────────────────────
-# Cluster consecutive hit=1 rows (each hit marker spans ~50 ms) into single
-# events and record the mean timestamp of each cluster.
-# The analyser then looks 50–300 ms *before* each event to find stick state
-# at the actual moment the shot was fired (accounting for server latency +
-# hit-marker animation delay).
-
-hit_events = np.array([])
-if 'hit' in df.columns and df['hit'].sum() > 0:
-    hit_ts = df.loc[df['hit'] == 1, 'timestamp'].values
-    clusters, cluster = [], [hit_ts[0]]
-    for t in hit_ts[1:]:
-        if t - cluster[-1] > 0.15:
-            clusters.append(np.mean(cluster))
-            cluster = []
-        cluster.append(t)
-    clusters.append(np.mean(cluster))
-    hit_events = np.array(clusters)
-    print(f"Hit events found: {len(hit_events)} across {len(selected)} session(s)\n")
+print(f"Loaded {len(selected)} session(s) across {len(character_groups)} character group(s):")
+for char, files in character_groups.items():
+    print(f"  {char}: {len(files)} session(s)")
+print()
 
 
 # ── Curve model ───────────────────────────────────────────────────────────────
@@ -107,9 +93,27 @@ def _find_zone_breakpoint_estimate(x_norm, dz_norm):
     return float(centers[mid][np.argmin(smoothed[mid])])
 
 
+def _extract_hit_events(df):
+    """
+    Cluster consecutive hit=1 rows (each marker spans ~50 ms) into single events
+    and return their mean timestamps.
+    """
+    if 'hit' not in df.columns or df['hit'].sum() == 0:
+        return np.array([])
+    hit_ts = df.loc[df['hit'] == 1, 'timestamp'].values
+    clusters, cluster = [], [hit_ts[0]]
+    for t in hit_ts[1:]:
+        if t - cluster[-1] > 0.15:
+            clusters.append(np.mean(cluster))
+            cluster = []
+        cluster.append(t)
+    clusters.append(np.mean(cluster))
+    return np.array(clusters)
+
+
 # ── Per-axis analysis ─────────────────────────────────────────────────────────
 
-def analyze_axis(col, values, timestamps, session_groups):
+def analyze_axis(col, values, timestamps, session_groups, hit_events, output_dir, character):
     abs_values = np.abs(values)
 
     # Deadzone — noise floor when stick rests near zero
@@ -121,13 +125,13 @@ def analyze_axis(col, values, timestamps, session_groups):
 
     active = abs_values[abs_values > deadzone]
     if len(active) < 30:
-        print(f"{col}: not enough active samples (deadzone={deadzone})")
+        print(f"  {col}: not enough active samples (deadzone={deadzone})")
         return
 
     # Max used range — outer clamp
     max_range = float(np.percentile(active, 98))
     if max_range < 0.01:
-        print(f"{col}: stick barely moved, skipping")
+        print(f"  {col}: stick barely moved, skipping")
         return
 
     x_norm = np.clip(active / max_range, 0, 1)
@@ -157,16 +161,15 @@ def analyze_axis(col, values, timestamps, session_groups):
     static_ratio = round(static_ratio, 3)
 
     # Marvel Rivals: Advanced Aim Sensitivity Curve Settings
-    mr_custom_min_range     = max(1,  round(deadzone * 100))     # Custom Minimum Range
-    mr_custom_max_range     = min(99, round(max_range * 100))    # Custom Maximum Range
-    mr_min_curve_statics    = round(static_ratio * 100)          # Minimum Curve Statics
-    mr_custom_max_dualzone  = round(bp_norm * 100)               # Custom Maximum Dual-zone Curve
+    mr_custom_min_range     = max(1,  round(deadzone * 100))
+    mr_custom_max_range     = min(99, round(max_range * 100))
+    mr_min_curve_statics    = round(static_ratio * 100)
+    mr_custom_max_dualzone  = round(bp_norm * 100)
 
     p25, p50, p75, p95 = (round(float(np.percentile(active, p)), 3) for p in (25, 50, 75, 95))
     inner_usage = round(float(np.mean(x_norm < bp_norm)) * 100, 1)
 
-    # Hit-moment stick positions — look back 50–300 ms before each hit event
-    # to recover the stick state when the shot was actually fired.
+    # Hit-moment stick positions — 50–300 ms before each hit event
     effective_abs = np.array([])
     if len(hit_events) > 0:
         ev_vals = []
@@ -176,24 +179,24 @@ def analyze_axis(col, values, timestamps, session_groups):
         if ev_vals:
             effective_abs = np.array(ev_vals)
 
-    print(f"{col}  ({len(values):,} samples across {len(session_groups)} session(s)):")
-    print(f"  ── Advanced Aim Sensitivity Curve Settings (Dual-Zone S-Curve) ──")
-    print(f"  Custom Minimum Range          : {mr_custom_min_range}")
-    print(f"  Custom Maximum Range          : {mr_custom_max_range}")
-    print(f"  Minimum Curve Statics         : {mr_min_curve_statics}")
-    print(f"  Custom Maximum Dual-zone Curve: {mr_custom_max_dualzone}")
-    print(f"  ── Data summary ──")
-    print(f"  Inner zone usage   : {inner_usage}% of active samples")
-    print(f"  Active percentiles : p25={p25}  p50={p50}  p75={p75}  p95={p95}")
+    print(f"  {col}  ({len(values):,} samples across {len(session_groups)} session(s)):")
+    print(f"    ── Advanced Aim Sensitivity Curve Settings (Dual-Zone S-Curve) ──")
+    print(f"    Custom Minimum Range          : {mr_custom_min_range}")
+    print(f"    Custom Maximum Range          : {mr_custom_max_range}")
+    print(f"    Minimum Curve Statics         : {mr_min_curve_statics}")
+    print(f"    Custom Maximum Dual-zone Curve: {mr_custom_max_dualzone}")
+    print(f"    ── Data summary ──")
+    print(f"    Inner zone usage   : {inner_usage}% of active samples")
+    print(f"    Active percentiles : p25={p25}  p50={p50}  p75={p75}  p95={p95}")
     if len(effective_abs) >= 5:
         ep25, ep50, ep75 = (round(float(np.percentile(effective_abs, p)), 3) for p in (25, 50, 75))
         eff_max = round(float(np.percentile(effective_abs, 95)), 3)
-        print(f"  ── Hit-moment aim analysis ({len(hit_events)} events, {len(effective_abs)} samples) ──")
-        print(f"  Effective percentiles : p25={ep25}  p50={ep50}  p75={ep75}")
+        print(f"    ── Hit-moment aim analysis ({len(hit_events)} events, {len(effective_abs)} samples) ──")
+        print(f"    Effective percentiles : p25={ep25}  p50={ep50}  p75={ep75}")
         if eff_max < max_range * 0.85:
             suggested_max = round(eff_max * 100)
-            print(f"  Note: effective max ({eff_max}) is well below overall max ({max_range:.3f})")
-            print(f"        Consider lowering Custom Maximum Range to ~{suggested_max}")
+            print(f"    Note: effective max ({eff_max}) is well below overall max ({max_range:.3f})")
+            print(f"          Consider lowering Custom Maximum Range to ~{suggested_max}")
     print()
 
     # Time-series — one continuous line per session with gap + boundary markers
@@ -206,13 +209,13 @@ def analyze_axis(col, values, timestamps, session_groups):
         if i < len(session_groups) - 1:
             plt.axvline(offset - 1.5, color='gray', linestyle=':', linewidth=0.8, alpha=0.6,
                         label='Session boundary' if i == 0 else None)
-    plt.title(f'{col} – Input over time ({len(session_groups)} session(s))')
+    plt.title(f'[{character}] {col} – Input over time ({len(session_groups)} session(s))')
     plt.xlabel('Time (s, sessions separated by gaps)')
     plt.ylabel('Axis value')
     if len(session_groups) > 1:
         plt.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(DATA_DIR / f'{col}_plot.png')
+    plt.savefig(output_dir / f'{col}_plot.png')
     plt.close()
 
     # Histogram with deadzone and zone boundary markers
@@ -220,19 +223,18 @@ def analyze_axis(col, values, timestamps, session_groups):
     plt.figure(figsize=(8, 4))
     plt.hist(values, bins=60, color='steelblue', alpha=0.7, label='All inputs')
     if len(effective_abs) >= 5:
-        # Mirror hit-moment absolute values to both sides for a symmetric overlay
         plt.hist(np.concatenate([effective_abs, -effective_abs]), bins=40,
                  color='limegreen', alpha=0.55, label=f'Hit moments (n={len(hit_events)})')
     plt.axvline( deadzone, color='red',    linestyle='--', label=f'Custom Minimum Range (±{mr_custom_min_range})')
     plt.axvline(-deadzone, color='red',    linestyle='--')
     plt.axvline( bp_abs,   color='orange', linestyle='--', label=f'Custom Max Dual-zone Curve (±{mr_custom_max_dualzone})')
     plt.axvline(-bp_abs,   color='orange', linestyle='--')
-    plt.title(f'{col} – Input distribution ({len(session_groups)} session(s))')
+    plt.title(f'[{character}] {col} – Input distribution ({len(session_groups)} session(s))')
     plt.xlabel('Axis value')
     plt.ylabel('Sample count')
     plt.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(DATA_DIR / f'{col}_hist.png')
+    plt.savefig(output_dir / f'{col}_hist.png')
     plt.close()
 
     # Dual-zone response curve
@@ -251,24 +253,60 @@ def analyze_axis(col, values, timestamps, session_groups):
                     label='Effective aim range (hit p25–p75)')
     plt.xlabel('Normalized physical input')
     plt.ylabel('Suggested output')
-    plt.title(f'{col} – Dual-Zone S-Curve (Marvel Rivals)')
+    plt.title(f'[{character}] {col} – Dual-Zone S-Curve (Marvel Rivals)')
     plt.legend(fontsize=8)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(DATA_DIR / f'{col}_curve.png')
+    plt.savefig(output_dir / f'{col}_curve.png')
     plt.close()
+
+
+# ── Per-character analysis ────────────────────────────────────────────────────
+
+def analyze_character(character, files):
+    print("=" * 60)
+    print(f"  Character: {character}")
+    print("=" * 60)
+
+    frames = []
+    for f in files:
+        s = pd.read_csv(f)
+        s['_session'] = f.name
+        frames.append(s)
+        duration = s['timestamp'].iloc[-1] - s['timestamp'].iloc[0]
+        print(f"  {f.name}  —  {len(s):,} samples  ({duration:.0f}s)")
+
+    df = pd.concat(frames, ignore_index=True)
+    total_duration = sum(
+        g['timestamp'].iloc[-1] - g['timestamp'].iloc[0]
+        for _, g in df.groupby('_session')
+    )
+    print(f"  Combined: {len(df):,} samples across {len(files)} session(s) ({total_duration:.0f}s active)")
+
+    hit_events = _extract_hit_events(df)
+    if len(hit_events) > 0:
+        print(f"  Hit events: {len(hit_events)}")
+    print()
+
+    output_dir = DATA_DIR / character
+    output_dir.mkdir(exist_ok=True)
+
+    session_groups = list(df.groupby('_session', sort=True))
+    timestamps = df['timestamp'].values
+    axis_cols = [c for c in df.columns if c.startswith('axis')]
+
+    for col in axis_cols:
+        analyze_axis(col, df[col].values, timestamps,
+                     session_groups, hit_events, output_dir, character)
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
-session_groups = list(df.groupby('_session', sort=True))
+for character, files in character_groups.items():
+    analyze_character(character, files)
 
-timestamps = df['timestamp'].values
+print("Analysis complete. Plots saved per character under data/<character>/")
 
-for col in axis_cols:
-    analyze_axis(col, df[col].values, timestamps, session_groups)
-
-print("Analysis complete. Plots saved in data/")
 
 # ── Archive ───────────────────────────────────────────────────────────────────
 

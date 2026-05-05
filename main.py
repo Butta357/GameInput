@@ -1,9 +1,10 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 import threading
 import pygame
 import time
 import csv
+import re
 import sys
 import subprocess
 from pathlib import Path
@@ -11,6 +12,21 @@ from pathlib import Path
 from hit_detector import HitDetector, AVAILABLE as HIT_DETECTION_AVAILABLE
 
 DATA_DIR = Path(__file__).parent / "data"
+
+# Marvel Rivals roster (Season 7.5, May 2026). Combobox stays editable so
+# heroes added in future patches can still be typed in.
+MARVEL_RIVALS_HEROES = [
+    "Adam Warlock", "Angela", "Black Cat", "Black Panther", "Black Widow",
+    "Blade", "Captain America", "Cloak and Dagger", "Daredevil", "Deadpool",
+    "Doctor Strange", "Elsa Bloodstone", "Emma Frost", "Gambit", "Groot",
+    "Hawkeye", "Hela", "Hulk", "Human Torch", "Invisible Woman",
+    "Iron Fist", "Iron Man", "Jeff the Land Shark", "Loki", "Luna Snow",
+    "Magik", "Magneto", "Mantis", "Mister Fantastic", "Moon Knight",
+    "Namor", "Peni Parker", "Phoenix", "Psylocke", "Rocket Raccoon",
+    "Rogue", "Scarlet Witch", "Spider-Man", "Squirrel Girl", "Star-Lord",
+    "Storm", "The Punisher", "The Thing", "Thor", "Ultron",
+    "Venom", "White Fox", "Winter Soldier", "Wolverine",
+]
 
 # The hit marker appears on screen slightly after the shot registers on the server.
 # We mark the 50 ms window after detection as hit=1 in the CSV.
@@ -44,6 +60,18 @@ class App(tk.Tk):
         screen_cy = self.winfo_screenheight() // 2
         self.hit_detector = HitDetector(screen_cx, screen_cy)
 
+        char_frame = tk.Frame(self)
+        tk.Label(char_frame, text="Character:").pack(side=tk.LEFT, padx=4)
+        self.character_var = tk.StringVar()
+        self.character_combo = ttk.Combobox(
+            char_frame,
+            textvariable=self.character_var,
+            values=MARVEL_RIVALS_HEROES,
+            width=22,
+        )
+        self.character_combo.pack(side=tk.LEFT)
+        char_frame.pack(pady=10)
+
         self.start_btn = tk.Button(self, text="Start Recording", command=self.start_recording)
         self.start_btn.pack(pady=10)
         self.stop_btn = tk.Button(self, text="Stop Recording", command=self.stop_recording, state=tk.DISABLED)
@@ -63,13 +91,23 @@ class App(tk.Tk):
     def _has_sessions(self):
         return DATA_DIR.is_dir() and any(DATA_DIR.glob("session_*.csv"))
 
+    @staticmethod
+    def _sanitize_character(name):
+        cleaned = re.sub(r'[^A-Za-z0-9_]+', '_', name.strip()).strip('_').lower()
+        return cleaned or None
+
     def start_recording(self):
+        character = self._sanitize_character(self.character_var.get())
+        if not character:
+            messagebox.showerror("Error", "Please enter a character name before recording.")
+            return
+
         self._stop_event.clear()
         self._last_hit_time = 0.0
         self._hit_count = 0
 
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.filename = DATA_DIR / f"session_{timestamp}.csv"
+        self.filename = DATA_DIR / f"session_{character}_{timestamp}.csv"
         DATA_DIR.mkdir(exist_ok=True)
 
         with open(self.filename, 'w', newline='') as csvfile:
@@ -91,6 +129,7 @@ class App(tk.Tk):
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self.analyze_btn.config(state=tk.DISABLED)
+        self.character_combo.config(state="disabled")
 
         self.hit_detector.start()
         threading.Thread(target=self.record_loop, daemon=True).start()
@@ -130,6 +169,7 @@ class App(tk.Tk):
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.analyze_btn.config(state=tk.NORMAL)
+        self.character_combo.config(state="normal")
 
     def analyze(self):
         analyzer = Path(__file__).parent / "analyzer.py"
