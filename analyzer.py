@@ -30,9 +30,13 @@ def _parse_character(path):
 #   --latest N      use only the N most recent sessions (across all characters)
 #   --archive       after analysis, move analyzed sessions to data/archived/
 #   --archive-old   after analysis, move sessions NOT analyzed to data/archived/
+#   --target pc     target the PC version of Marvel Rivals (default: console).
+#                   Recording always happens on PC, but settings are usually
+#                   going back to console where aim assist is stronger.
 # Examples:
 #   python analyzer.py --latest 3 --archive-old
 #   python analyzer.py --archive
+#   python analyzer.py --target pc
 
 all_files = sorted(
     [f for f in DATA_DIR.iterdir() if f.name.startswith('session_') and f.suffix == '.csv'],
@@ -48,6 +52,17 @@ if '--latest' in sys.argv:
         n_sessions = int(sys.argv[sys.argv.index('--latest') + 1])
     except (IndexError, ValueError):
         print("Usage: python analyzer.py --latest N")
+        exit(1)
+
+target_platform = "console"
+if '--target' in sys.argv:
+    try:
+        choice = sys.argv[sys.argv.index('--target') + 1].lower()
+        if choice not in ("pc", "console"):
+            raise ValueError
+        target_platform = choice
+    except (IndexError, ValueError):
+        print("Usage: python analyzer.py --target [pc|console]")
         exit(1)
 
 selected = all_files[-n_sessions:]
@@ -335,6 +350,7 @@ def analyze_axis(col, values, timestamps, session_groups, hit_events, output_dir
     pin_time_pct = round(float(np.mean(active >= 0.95) * 100), 2)
     hit_p50 = (round(float(np.percentile(effective_abs, 50)), 3)
                if len(effective_abs) >= 5 else None)
+    active_p50 = round(float(np.percentile(active, 50)), 3)
 
     return {
         "custom_minimum_range":           mr_custom_min_range,
@@ -344,12 +360,13 @@ def analyze_axis(col, values, timestamps, session_groups, hit_events, output_dir
         "samples":                        int(len(values)),
         "pin_time_pct":                   pin_time_pct,
         "hit_moment_p50":                 hit_p50,
+        "active_p50":                     active_p50,
     }
 
 
 # ── Per-character analysis ────────────────────────────────────────────────────
 
-def analyze_character(character, files):
+def analyze_character(character, files, target_platform):
     print("=" * 60)
     print(f"  Character: {character}")
     print("=" * 60)
@@ -387,6 +404,16 @@ def analyze_character(character, files):
               f"max={current_curve['custom_maximum_range']} "
               f"statics={current_curve['minimum_curve_statics']} "
               f"max_dz={current_curve['custom_maximum_dual_zone_curve']}")
+        # Per-character override: current.json may pin a different target
+        if isinstance(current_curve.get("target_platform"), str):
+            override = current_curve["target_platform"].lower()
+            if override in ("pc", "console"):
+                target_platform = override
+
+    cross_platform = (target_platform == "console")  # recording is always PC
+    print(f"  Target platform: {target_platform}"
+          + ("  (PC→console: AA hint thresholds shifted to expect stronger AA on target)"
+             if cross_platform else "  (no shift)"))
 
     session_groups = list(df.groupby('_session', sort=True))
     timestamps = df['timestamp'].values
@@ -438,9 +465,104 @@ def analyze_character(character, files):
         else:
             suggestion = "looks balanced for current curve"
 
+        # Aim-assist hints — one per setting exposed in Marvel Rivals.
+        # These are heuristics derived from input patterns, not ground-truth
+        # measurements of AA contribution. They flag whether the data is
+        # consistent with each setting being too high / low / balanced.
+        #
+        #   Strength (magnetism): low right-stick deflection at hits relative
+        #     to overall play means AA is pulling the reticle onto targets
+        #     with minimal stick input.
+        #   Slowdown (friction):  high right-stick deflection at hits combined
+        #     with low camera saturation means the stick is moving but the
+        #     camera is being held back by friction near the target.
+        #   Rotational:           significant left-stick activity at hit
+        #     moments means the player is strafing while landing shots,
+        #     which is where rotational assist contributes most.
+        active_p50s = [per_axis[a]["active_p50"] for a in aim_axes]
+        avg_active_p50 = round(float(np.mean(active_p50s)), 3)
+
+        # --- Strength ---
+        # Recording happens on PC where AA is weaker. If target is console,
+        # the SAME ratio implies HEAVIER AA contribution at the target (console
+        # AA is stronger at equivalent slider values). So thresholds shift up:
+        # a ratio of 0.70 on PC data targeting console is functionally what
+        # 0.55 ratio means on console-recorded data.
+        if cross_platform:
+            heavy_threshold, light_threshold = 0.70, 1.55
+            platform_note = " (PC→console shift: console AA will pull harder than this data shows)"
+        else:
+            heavy_threshold, light_threshold = 0.55, 1.40
+            platform_note = ""
+
+        if avg_hit_p50 is None:
+            strength_ratio = None
+            strength_suggestion = "insufficient hit data - record with hit detection on"
+        else:
+            strength_ratio = round(avg_hit_p50 / max(avg_active_p50, 1e-3), 2)
+            if strength_ratio < heavy_threshold:
+                strength_suggestion = (f"Strength contributing heavily - hits at "
+                                       f"{strength_ratio}x typical deflection. "
+                                       f"Lower for more manual control{platform_note}")
+            elif strength_ratio > light_threshold:
+                strength_suggestion = (f"Strength may be too low - hits require "
+                                       f"{strength_ratio}x typical deflection. "
+                                       f"Raise Strength to pull reticle onto targets")
+            else:
+                strength_suggestion = (f"Strength looks balanced "
+                                       f"(hit/active ratio {strength_ratio}){platform_note}")
+
+        # --- Rotational ---
+        # Use left-stick magnitude at hit moments. axis_0/axis_1 are the left
+        # stick on this controller. High deflection during hits => strafing.
+        left_axes = [a for a in ("axis_0", "axis_1") if a in per_axis]
+        left_hit_p50s = [per_axis[a]["hit_moment_p50"] for a in left_axes
+                         if per_axis[a]["hit_moment_p50"] is not None]
+        if not left_hit_p50s:
+            rotational_suggestion = "no left-stick hit data - cannot evaluate"
+            avg_left_hit_p50 = None
+        else:
+            avg_left_hit_p50 = round(float(np.mean(left_hit_p50s)), 3)
+            if avg_left_hit_p50 > 0.40:
+                rotational_suggestion = (f"high strafing during hits "
+                                         f"(left-stick p50={avg_left_hit_p50}) - "
+                                         f"Rotational AA is in play, max it if you "
+                                         f"depend on it; reduce for muscle-memory tracking")
+            elif avg_left_hit_p50 > 0.15:
+                rotational_suggestion = (f"moderate strafing during hits "
+                                         f"(left-stick p50={avg_left_hit_p50}) - "
+                                         f"Rotational helps, current level reasonable")
+            else:
+                rotational_suggestion = (f"minimal strafing during hits "
+                                         f"(left-stick p50={avg_left_hit_p50}) - "
+                                         f"Rotational AA contributes little to your hits")
+
+        # --- Slowdown ---
+        # Heuristic w/o camera data: if right-stick at hits is moderate-high
+        # (not low) AND pin time is low, friction is plausibly preventing
+        # the stick from reaching the rail. Refined later when camera_motion
+        # is available (see below where current.json is processed).
+        slowdown_platform_note = (" (console friction is stronger than PC at "
+                                  "the same slider, so expect more pronounced "
+                                  "effect on target)") if cross_platform else ""
+        if avg_hit_p50 is None:
+            slowdown_suggestion = "insufficient hit data"
+        elif avg_hit_p50 > 0.50 and avg_pin < 5:
+            slowdown_suggestion = (f"Slowdown likely active - high hit deflection "
+                                   f"({avg_hit_p50}) without pinning suggests friction "
+                                   f"is engaging on targets{slowdown_platform_note}")
+        elif avg_hit_p50 < 0.20:
+            slowdown_suggestion = (f"hard to evaluate - hits happen at low deflection "
+                                   f"so Slowdown rarely engages")
+        else:
+            slowdown_suggestion = (f"Slowdown contribution unclear from input alone "
+                                   f"(load current.json for camera-motion signal)"
+                                   f"{slowdown_platform_note}")
+
         recommended = {
             "source_axes":                    aim_axes,
             "aim_curve_type":                 "Dual Zone S Curve",
+            "target_platform":                target_platform,
             "custom_minimum_range":           int(cmin),
             "custom_maximum_range":           int(cmax),
             "minimum_curve_statics":          int(statics),
@@ -449,6 +571,22 @@ def analyze_character(character, files):
                 "stick_pin_time_pct": round(avg_pin, 1),
                 "hit_moment_p50":     avg_hit_p50,
                 "suggestion":         suggestion,
+            },
+            "aim_assist_hints": {
+                "right_stick_hit_p50":    avg_hit_p50,
+                "right_stick_active_p50": avg_active_p50,
+                "left_stick_hit_p50":     avg_left_hit_p50,
+                "strength": {
+                    "hit_to_active_ratio": strength_ratio,
+                    "suggestion":          strength_suggestion,
+                },
+                "rotational": {
+                    "left_stick_hit_p50": avg_left_hit_p50,
+                    "suggestion":         rotational_suggestion,
+                },
+                "slowdown": {
+                    "suggestion": slowdown_suggestion,
+                },
             },
         }
 
@@ -508,6 +646,30 @@ def analyze_character(character, files):
                 "suggestion":         suggestion,
             }
 
+            # Sharper Slowdown hint: friction shows up as right-stick deflection
+            # outpacing camera motion. If right-stick is being pushed but camera
+            # rarely saturates, the curve is fine and friction is doing its job.
+            avg_right_hit = recommended["aim_assist_hints"]["right_stick_hit_p50"]
+            if avg_right_hit is not None:
+                if avg_right_hit > 0.45 and sat < 3:
+                    slowdown_msg = (f"Slowdown engaging on targets - high stick "
+                                    f"deflection ({avg_right_hit}) with camera "
+                                    f"saturated only {sat}%. Lower Slowdown if "
+                                    f"flicks feel sluggish")
+                elif avg_right_hit < 0.25 and sat < 1:
+                    slowdown_msg = (f"Slowdown rarely needed - hits at low "
+                                    f"deflection ({avg_right_hit}). Strength is "
+                                    f"doing more work than Slowdown")
+                else:
+                    slowdown_msg = (f"Slowdown contribution moderate "
+                                    f"(hit deflection {avg_right_hit}, "
+                                    f"camera saturated {sat}%)")
+                recommended["aim_assist_hints"]["slowdown"] = {
+                    "camera_saturated_pct": sat,
+                    "right_stick_hit_p50":  avg_right_hit,
+                    "suggestion":           slowdown_msg,
+                }
+
     settings = {
         "character":     character,
         "sessions":      [f.name for f in files],
@@ -546,13 +708,17 @@ def analyze_character(character, files):
                   f"p95={camera_motion['p95']} saturated={camera_motion['saturated_pct']}%")
         hint = recommended["sensitivity_hint"]
         print(f"        Sensitivity hint              : {hint['suggestion']}")
+        aa = recommended["aim_assist_hints"]
+        print(f"        AA Strength hint              : {aa['strength']['suggestion']}")
+        print(f"        AA Slowdown hint              : {aa['slowdown']['suggestion']}")
+        print(f"        AA Rotational hint            : {aa['rotational']['suggestion']}")
     print(f"  --> Wrote {settings_path}\n")
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 for character, files in character_groups.items():
-    analyze_character(character, files)
+    analyze_character(character, files, target_platform)
 
 print("Analysis complete. Plots saved per character under data/<character>/")
 
